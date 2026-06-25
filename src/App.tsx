@@ -17,6 +17,7 @@ import {
   Clock,
   Layers,
   Upload,
+  ClipboardList,
 } from 'lucide-react'
 
 const STORAGE_KEY = 'context_manager_v1'
@@ -253,6 +254,16 @@ export default function App() {
             }
           />
         )}
+        {view === 'claude-md' && (
+          <ClaudeMdView
+            agentsFiles={state.agentsFiles}
+            projects={state.projects}
+            projectName={projectName}
+            onUpdate={(updater) =>
+              updateState((prev) => ({ ...prev, agentsFiles: updater(prev.agentsFiles) }))
+            }
+          />
+        )}
         {view === 'project-folder' && (
           <ProjectFolderView state={state} onUpdate={updateState} />
         )}
@@ -315,6 +326,7 @@ function NavTabs({ view, onNavigate }: { view: string; onNavigate: (v: string) =
     { id: 'projects', icon: FolderOpen, label: 'Projetos' },
     { id: 'prompts', icon: MessageSquare, label: 'Prompts' },
     { id: 'agents', icon: FileText, label: 'AGENTS.md' },
+    { id: 'claude-md', icon: ClipboardList, label: 'CLAUDE.md' },
     { id: 'project-folder', icon: Layers, label: 'Pasta de Projeto' },
     { id: 'search', icon: Search, label: 'Busca' },
   ]
@@ -1184,6 +1196,236 @@ function PreviewTabs({ markdown, claudeMarkdown, onSave }: { markdown: string; c
   )
 }
 
+function ClaudeMdView({
+  agentsFiles,
+  projects,
+  projectName,
+  onUpdate,
+}: {
+  agentsFiles: AgentsFile[]
+  projects: Project[]
+  projectName: (id: string | null) => string | null
+  onUpdate: (updater: (prev: AgentsFile[]) => AgentsFile[]) => void
+}) {
+  const [editing, setEditing] = useState<AgentsFile | null>(null)
+  const [showEditor, setShowEditor] = useState(false)
+
+  const claudeEntries = agentsFiles.filter((a) => a.claudeMarkdown || a.answers?.projectDescription || a.answers?.stack)
+
+  function handleDelete(id: string) {
+    if (confirm('Excluir este CLAUDE.md?')) {
+      onUpdate((prev) => prev.filter((a) => a.id !== id))
+    }
+  }
+
+  function handleSave(data: Partial<AgentsFile>) {
+    if (editing) {
+      onUpdate((prev) =>
+        prev.map((a) => (a.id === editing.id ? { ...a, ...data, updatedAt: nowISO() } : a))
+      )
+    }
+    setShowEditor(false)
+    setEditing(null)
+  }
+
+  if (showEditor && editing) {
+    return (
+      <ClaudeMdEditor
+        agentsFile={editing}
+        projects={projects}
+        projectName={projectName}
+        onSave={handleSave}
+        onClose={() => { setShowEditor(false); setEditing(null) }}
+      />
+    )
+  }
+
+  return (
+    <section className="view active">
+      <div className="view-header">
+        <div>
+          <p className="eyebrow">Documentação IA</p>
+          <h1 className="page-title">CLAUDE.md</h1>
+        </div>
+      </div>
+      <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginBottom: 20 }}>
+        Crie e edite arquivos CLAUDE.md a partir dos dados dos seus projetos. Cada CLAUDE.md gera um resumo pronto para a IA entender seu projeto.
+      </p>
+      <div className="grid">
+        {claudeEntries.length === 0 ? (
+          <div className="empty" style={{ gridColumn: '1/-1' }}>
+            <ClipboardList size={32} />
+            <div>Nenhum CLAUDE.md disponível. Crie um AGENTS.md primeiro para gerar o CLAUDE.md automaticamente.</div>
+          </div>
+        ) : (
+          claudeEntries.map((a) => (
+            <div key={a.id} className="card item-card">
+              <div className="item-top">
+                <p className="item-title">{a.title || 'CLAUDE.md'}</p>
+                <div className="item-actions">
+                  <button className="btn btn-icon btn-ghost" onClick={() => downloadText('CLAUDE.md', a.claudeMarkdown || generateClaudeMarkdown(a.answers || {}))}>
+                    <Download size={14} />
+                  </button>
+                  <button className="btn btn-icon btn-danger" onClick={() => handleDelete(a.id)}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </div>
+              {a.projectId && projectName(a.projectId) ? (
+                <span className="badge">{projectName(a.projectId)}</span>
+              ) : (
+                <span className="badge">Sem projeto</span>
+              )}
+              <div className="item-text">
+                {(a.claudeMarkdown || generateClaudeMarkdown(a.answers || {})).split('\n').slice(0, 4).join('\n')}
+              </div>
+              <div className="item-meta">
+                Atualizado em {fmtDate(a.updatedAt || a.createdAt)}
+              </div>
+              <button
+                className="btn btn-secondary"
+                style={{ marginTop: 6 }}
+                onClick={() => { setEditing(a); setShowEditor(true) }}
+              >
+                Editar CLAUDE.md
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  )
+}
+
+function ClaudeMdEditor({
+  agentsFile,
+  projects,
+  projectName,
+  onSave,
+  onClose,
+}: {
+  agentsFile: AgentsFile
+  projects: Project[]
+  projectName: (id: string | null) => string | null
+  onSave: (data: Partial<AgentsFile>) => void
+  onClose: () => void
+}) {
+  const [projectDescription, setProjectDescription] = useState(agentsFile.answers?.projectDescription || '')
+  const [stack, setStack] = useState(agentsFile.answers?.stack || 'TypeScript')
+  const [framework, setFramework] = useState(agentsFile.answers?.framework || '')
+  const [commands, setCommands] = useState(agentsFile.answers?.commands || '')
+  const [codeStyle, setCodeStyle] = useState(agentsFile.answers?.codeStyle || 'camelCase')
+  const [commentLevel, setCommentLevel] = useState(agentsFile.answers?.commentLevel || 'Mínimo')
+  const [commitStyle, setCommitStyle] = useState(agentsFile.answers?.commitStyle || 'Conventional Commits')
+  const [prohibitions, setProhibitions] = useState<string[]>(agentsFile.answers?.prohibitions || [])
+
+  const claudeMarkdown = useMemo(() => {
+    return generateClaudeMarkdown({
+      projectDescription,
+      stack,
+      framework,
+      commands,
+      codeStyle,
+      commentLevel,
+      commitStyle,
+      prohibitions,
+    })
+  }, [projectDescription, stack, framework, commands, codeStyle, commentLevel, commitStyle, prohibitions])
+
+  function toggleProhibition(value: string) {
+    setProhibitions((prev) => (prev.includes(value) ? prev.filter((p) => p !== value) : [...prev, value]))
+  }
+
+  return (
+    <>
+      <div className="view-header">
+        <div>
+          <p className="eyebrow">Editor</p>
+          <h1 className="page-title" style={{ fontSize: 24 }}>
+            Editar CLAUDE.md — {agentsFile.title}
+          </h1>
+        </div>
+        <button className="btn btn-secondary" onClick={onClose}>
+          <X size={16} /> Voltar
+        </button>
+      </div>
+      <div className="editor-grid">
+        <div>
+          <div className="field">
+            <label>Contexto do projeto</label>
+            <textarea value={projectDescription} onChange={(e) => setProjectDescription(e.target.value)} placeholder="Descreva o projeto..." />
+          </div>
+          <div className="field-row">
+            <div className="field">
+              <label>Stack</label>
+              <select value={stack} onChange={(e) => setStack(e.target.value)}>
+                <option>JavaScript</option>
+                <option>TypeScript</option>
+                <option>Python</option>
+                <option>Go</option>
+                <option>PHP</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Framework</label>
+              <input type="text" value={framework} onChange={(e) => setFramework(e.target.value)} placeholder="Ex: Next.js" />
+            </div>
+          </div>
+          <div className="field-row">
+            <div className="field">
+              <label>Nomenclatura</label>
+              <select value={codeStyle} onChange={(e) => setCodeStyle(e.target.value)}>
+                <option>camelCase</option>
+                <option>snake_case</option>
+                <option>PascalCase</option>
+                <option>kebab-case</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Comentários</label>
+              <select value={commentLevel} onChange={(e) => setCommentLevel(e.target.value)}>
+                <option>Mínimo</option>
+                <option>Descritivo</option>
+                <option>Nenhum</option>
+              </select>
+            </div>
+          </div>
+          <div className="field">
+            <label>Commits</label>
+            <select value={commitStyle} onChange={(e) => setCommitStyle(e.target.value)}>
+              <option>Conventional Commits</option>
+              <option>Sem estilo específico</option>
+            </select>
+          </div>
+          <div className="field">
+            <label>Comandos úteis (build, dev, test)</label>
+            <textarea value={commands} onChange={(e) => setCommands(e.target.value)} placeholder="Ex: npm run dev&#10;npm run build&#10;npm test" />
+          </div>
+          <div className="field">
+            <label>Cuidados</label>
+            {['Sem any', 'Sem console.log', 'Sem var', 'Sem comentário óbvio'].map((opt) => (
+              <label key={opt} className="checkline">
+                <input type="checkbox" checked={prohibitions.includes(opt)} onChange={() => toggleProhibition(opt)} />
+                {opt}
+              </label>
+            ))}
+          </div>
+        </div>
+        <div>
+          <PreviewTabs markdown={agentsFile.markdown} claudeMarkdown={claudeMarkdown}
+            onSave={() =>
+              onSave({
+                answers: { ...agentsFile.answers, projectDescription, stack, framework, commands, codeStyle, commentLevel, commitStyle, prohibitions },
+                claudeMarkdown,
+              })
+            }
+          />
+        </div>
+      </div>
+    </>
+  )
+}
+
 function ProjectFolderView({ state, onUpdate }: { state: State; onUpdate: (updater: (prev: State) => State) => void }) {
   const [selectedProjectId, setSelectedProjectId] = useState('')
   const [selectedAgentsId, setSelectedAgentsId] = useState('')
@@ -1194,6 +1436,7 @@ function ProjectFolderView({ state, onUpdate }: { state: State; onUpdate: (updat
   const [showAllPrompts, setShowAllPrompts] = useState(false)
   const [designContent, setDesignContent] = useState('')
   const [designPreview, setDesignPreview] = useState('')
+  const [designWarning, setDesignWarning] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const project = state.projects.find((p) => p.id === selectedProjectId)
@@ -1231,6 +1474,11 @@ function ProjectFolderView({ state, onUpdate }: { state: State; onUpdate: (updat
       const text = reader.result as string
       setDesignContent(text)
       setDesignPreview(text.split('\n').slice(0, 5).join('\n'))
+      if (!text.trimStart().startsWith('---')) {
+        setDesignWarning('Aviso: este arquivo não contém frontmatter (---) no início.')
+      } else {
+        setDesignWarning('')
+      }
     }
     reader.readAsText(file)
   }
@@ -1319,7 +1567,7 @@ function ProjectFolderView({ state, onUpdate }: { state: State; onUpdate: (updat
         <div className="folder-selects">
           <div className="field">
             <label>Escolher projeto</label>
-            <select value={selectedProjectId} onChange={(e) => { setSelectedProjectId(e.target.value); setSelectedAgentsId(''); setSelectedPrompts(new Set()) }}>
+            <select value={selectedProjectId} onChange={(e) => { setSelectedProjectId(e.target.value); setSelectedAgentsId(''); setSelectedPrompts(new Set()); setDesignWarning('') }}>
               <option value="">Nenhum</option>
               {state.projects.map((p) => (
                 <option key={p.id} value={p.id}>{p.name}</option>
@@ -1373,7 +1621,8 @@ function ProjectFolderView({ state, onUpdate }: { state: State; onUpdate: (updat
                     <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()}>
                       <Upload size={14} /> Importar arquivo
                     </button>
-                    <textarea value={designContent} onChange={(e) => { setDesignContent(e.target.value); setDesignPreview(e.target.value.split('\n').slice(0, 5).join('\n')) }} placeholder="Ou cole o conteúdo do design.md aqui..." style={{ minHeight: 80 }} />
+                    <textarea value={designContent} onChange={(e) => { setDesignContent(e.target.value); setDesignPreview(e.target.value.split('\n').slice(0, 5).join('\n')); if (!e.target.value.trimStart().startsWith('---')) { setDesignWarning('Aviso: este arquivo não contém frontmatter (---) no início.') } else { setDesignWarning('') } }} placeholder="Ou cole o conteúdo do design.md aqui..." style={{ minHeight: 80 }} />
+                    {designWarning && <p style={{ color: '#e6a756', fontSize: 11, marginTop: 4 }}>{designWarning}</p>}
                     {designContent && <button className="btn btn-primary btn-sm" onClick={saveDesignAsset}>Salvar como design.md do projeto</button>}
                   </div>
                 )}
