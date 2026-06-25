@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import JSZip from 'jszip'
 import {
   Home,
   FolderOpen,
@@ -50,15 +51,26 @@ interface AgentsFile {
   projectId: string | null
   answers: Record<string, any>
   markdown: string
+  claudeMarkdown: string | null
   history: { markdown: string; savedAt: string }[]
   createdAt: string
   updatedAt: string
+}
+
+interface Asset {
+  id: string
+  projectId: string
+  filename: string
+  content: string
+  type: string
+  createdAt: string
 }
 
 interface State {
   projects: Project[]
   prompts: Prompt[]
   agentsFiles: AgentsFile[]
+  assets: Asset[]
 }
 
 function uid() {
@@ -82,9 +94,50 @@ function fmtDate(iso: string) {
 function loadState(): State {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) return JSON.parse(raw)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (!parsed.assets) parsed.assets = []
+      parsed.agentsFiles?.forEach((a: AgentsFile) => {
+        if (a.claudeMarkdown === undefined) a.claudeMarkdown = null
+        if (a.answers && a.answers.commands === undefined) a.answers.commands = ''
+      })
+      return parsed
+    }
   } catch {}
-  return { projects: [], prompts: [], agentsFiles: [] }
+  return { projects: [], prompts: [], agentsFiles: [], assets: [] }
+}
+
+function slugify(str: string) {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+}
+
+function generateClaudeMarkdown(answers: Record<string, any>) {
+  return `# CLAUDE.md
+
+## Visão geral do projeto
+${answers.projectDescription || 'Sem descrição.'}
+
+## Stack
+${answers.stack || 'Não definido'}${answers.framework ? `, ${answers.framework}` : ''}
+
+## Comandos úteis
+${answers.commands || 'Nenhum comando definido.'}
+
+## Convenções
+Nomenclatura: ${answers.codeStyle || 'camelCase'}. Comentários: ${answers.commentLevel || 'Mínimo'}. Commits: ${answers.commitStyle || 'Conventional Commits'}.
+
+## Cuidados
+${answers.prohibitions?.length ? answers.prohibitions.join(', ') : 'Nenhuma.'}
+
+## Consulte também
+- AGENTS.md (regras detalhadas para agentes de código)
+- design.md (sistema visual, se houver)
+`
 }
 
 export default function App() {
@@ -200,6 +253,9 @@ export default function App() {
             }
           />
         )}
+        {view === 'project-folder' && (
+          <ProjectFolderView state={state} onUpdate={updateState} />
+        )}
         {view === 'search' && (
           <SearchView
             query={globalSearch}
@@ -259,6 +315,7 @@ function NavTabs({ view, onNavigate }: { view: string; onNavigate: (v: string) =
     { id: 'projects', icon: FolderOpen, label: 'Projetos' },
     { id: 'prompts', icon: MessageSquare, label: 'Prompts' },
     { id: 'agents', icon: FileText, label: 'AGENTS.md' },
+    { id: 'project-folder', icon: Layers, label: 'Pasta de Projeto' },
     { id: 'search', icon: Search, label: 'Busca' },
   ]
 
@@ -932,6 +989,7 @@ function AgentsEditor({
   const [commitStyle, setCommitStyle] = useState(agentsFile?.answers?.commitStyle || 'Conventional Commits')
   const [errorHandling, setErrorHandling] = useState(agentsFile?.answers?.errorHandling || 'try/catch')
   const [commentLevel, setCommentLevel] = useState(agentsFile?.answers?.commentLevel || 'Mínimo')
+  const [commands, setCommands] = useState(agentsFile?.answers?.commands || '')
   const [prohibitions, setProhibitions] = useState<string[]>(agentsFile?.answers?.prohibitions || [])
 
   const markdown = useMemo(() => {
@@ -976,7 +1034,20 @@ ${prohibitions.length ? prohibitions.map((p) => `- ${p}`).join('\n') : '- Nenhum
 ${codeExamples[codeStyle] || ''}
 \`\`\`
 `
-  }, [title, projectId, description, stack, framework, codeStyle, tests, folderStructure, linter, commitStyle, errorHandling, commentLevel, prohibitions])
+  }, [title, projectId, description, stack, framework, codeStyle, tests, folderStructure, linter, commitStyle, errorHandling, commentLevel, prohibitions, commands])
+
+  const claudeMarkdown = useMemo(() => {
+    return generateClaudeMarkdown({
+      projectDescription: description,
+      stack,
+      framework,
+      commands,
+      codeStyle,
+      commentLevel,
+      commitStyle,
+      prohibitions,
+    })
+  }, [description, stack, framework, commands, codeStyle, commentLevel, commitStyle, prohibitions])
 
   function toggleProhibition(value: string) {
     setProhibitions((prev) => (prev.includes(value) ? prev.filter((p) => p !== value) : [...prev, value]))
@@ -1052,6 +1123,10 @@ ${codeExamples[codeStyle] || ''}
             </div>
           </div>
           <div className="field">
+            <label>Comandos úteis (build, dev, test)</label>
+            <textarea value={commands} onChange={(e) => setCommands(e.target.value)} placeholder="Ex: npm run dev&#10;npm run build&#10;npm test" />
+          </div>
+          <div className="field">
             <label>Proibições</label>
             {['Sem any', 'Sem console.log', 'Sem var', 'Sem comentário óbvio'].map((opt) => (
               <label key={opt} className="checkline">
@@ -1062,37 +1137,312 @@ ${codeExamples[codeStyle] || ''}
           </div>
         </div>
         <div>
-          <div className="preview-pane">
-            <div className="preview-head">
-              <span className="preview-dot" />
-              <span className="preview-filename">AGENTS.md</span>
-            </div>
-            <div className="preview-body">{markdown}</div>
-            <div className="preview-foot">
-              <button
-                className="btn btn-primary"
-                onClick={() =>
-                  onSave({
-                    title: title || 'AGENTS.md',
-                    projectId: projectId || null,
-                    answers: { projectDescription: description, stack, framework, codeStyle, tests, folderStructure, linter, commitStyle, errorHandling, commentLevel, prohibitions },
-                    markdown,
-                  })
-                }
-              >
-                <Check size={14} /> Salvar
-              </button>
-              <button className="btn btn-secondary" onClick={() => navigator.clipboard.writeText(markdown)}>
-                <Copy size={14} /> Copiar
-              </button>
-              <button className="btn btn-secondary" onClick={() => downloadText('AGENTS.md', markdown)}>
-                <Download size={14} /> Baixar
-              </button>
-            </div>
-          </div>
+          <PreviewTabs markdown={markdown} claudeMarkdown={claudeMarkdown}
+            onSave={() =>
+              onSave({
+                title: title || 'AGENTS.md',
+                projectId: projectId || null,
+                answers: { projectDescription: description, stack, framework, codeStyle, tests, folderStructure, linter, commitStyle, errorHandling, commentLevel, prohibitions, commands },
+                markdown,
+                claudeMarkdown,
+              })
+            }
+          />
         </div>
       </div>
     </>
+  )
+}
+
+function PreviewTabs({ markdown, claudeMarkdown, onSave }: { markdown: string; claudeMarkdown: string; onSave: () => void }) {
+  const [tab, setTab] = useState<'agents' | 'claude'>('agents')
+  const content = tab === 'agents' ? markdown : claudeMarkdown
+  const filename = tab === 'agents' ? 'AGENTS.md' : 'CLAUDE.md'
+
+  return (
+    <div className="preview-pane">
+      <div className="preview-head">
+        <span className="preview-dot" />
+        <div className="preview-tabs-row">
+          <button className={`preview-tab ${tab === 'agents' ? 'active' : ''}`} onClick={() => setTab('agents')}>AGENTS.md</button>
+          <button className={`preview-tab ${tab === 'claude' ? 'active' : ''}`} onClick={() => setTab('claude')}>CLAUDE.md</button>
+        </div>
+      </div>
+      <div className="preview-body">{content}</div>
+      <div className="preview-foot">
+        <button className="btn btn-primary" onClick={onSave}>
+          <Check size={14} /> Salvar
+        </button>
+        <button className="btn btn-secondary" onClick={() => navigator.clipboard.writeText(content)}>
+          <Copy size={14} /> Copiar {filename}
+        </button>
+        <button className="btn btn-secondary" onClick={() => downloadText(filename, content)}>
+          <Download size={14} /> Baixar {filename}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ProjectFolderView({ state, onUpdate }: { state: State; onUpdate: (updater: (prev: State) => State) => void }) {
+  const [selectedProjectId, setSelectedProjectId] = useState('')
+  const [selectedAgentsId, setSelectedAgentsId] = useState('')
+  const [includeClaude, setIncludeClaude] = useState(false)
+  const [includeDesign, setIncludeDesign] = useState(true)
+  const [includeNotes, setIncludeNotes] = useState(true)
+  const [selectedPrompts, setSelectedPrompts] = useState<Set<string>>(new Set())
+  const [showAllPrompts, setShowAllPrompts] = useState(false)
+  const [designContent, setDesignContent] = useState('')
+  const [designPreview, setDesignPreview] = useState('')
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const project = state.projects.find((p) => p.id === selectedProjectId)
+  const projectAgents = state.agentsFiles.filter((a) => a.projectId === selectedProjectId)
+  const projectPrompts = state.prompts.filter((p) => p.projectId === selectedProjectId)
+  const allPrompts = showAllPrompts ? state.prompts.filter((p) => !p.projectId) : []
+  const existingDesign = state.assets.find((a) => a.projectId === selectedProjectId && a.type === 'design')
+
+  const selectedAgent = projectAgents.find((a) => a.id === selectedAgentsId)
+
+  useEffect(() => {
+    if (existingDesign) {
+      setDesignContent(existingDesign.content)
+      setDesignPreview(existingDesign.content.split('\n').slice(0, 5).join('\n'))
+    } else {
+      setDesignContent('')
+      setDesignPreview('')
+    }
+  }, [existingDesign, selectedProjectId])
+
+  function togglePrompt(id: string) {
+    setSelectedPrompts((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function handleDesignImport(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const text = reader.result as string
+      setDesignContent(text)
+      setDesignPreview(text.split('\n').slice(0, 5).join('\n'))
+    }
+    reader.readAsText(file)
+  }
+
+  function saveDesignAsset() {
+    if (!selectedProjectId || !designContent) return
+    if (existingDesign) {
+      if (!confirm('Já existe um design.md para este projeto. Substituir?')) return
+      onUpdate((prev) => ({
+        ...prev,
+        assets: prev.assets.map((a) =>
+          a.id === existingDesign.id ? { ...a, content: designContent, filename: 'design.md' } : a
+        ),
+      }))
+    } else {
+      onUpdate((prev) => ({
+        ...prev,
+        assets: [...prev.assets, { id: uid(), projectId: selectedProjectId, filename: 'design.md', content: designContent, type: 'design', createdAt: nowISO() }],
+      }))
+    }
+  }
+
+  function buildFileTree() {
+    if (!project) return []
+    const slug = slugify(project.name)
+    const tree: string[] = [`${slug}/`]
+    if (selectedAgent) tree.push('  AGENTS.md')
+    if (includeClaude) tree.push('  CLAUDE.md')
+    if (designContent && includeDesign) tree.push('  design.md')
+    const hasCtx = includeNotes && (project.notes || project.rules) || selectedPrompts.size > 0
+    if (hasCtx) tree.push('  context/')
+    if (includeNotes && (project.notes || project.rules)) tree.push('    PROJETO.md')
+    if (selectedPrompts.size > 0) {
+      tree.push('    prompts/')
+      state.prompts.filter((p) => selectedPrompts.has(p.id)).forEach((p) => {
+        tree.push(`      ${slugify(p.title)}.md`)
+      })
+    }
+    return tree
+  }
+
+  async function handleExport() {
+    if (!project) return
+    const zip = new JSZip()
+    if (selectedAgent) zip.file('AGENTS.md', selectedAgent.markdown)
+    if (includeClaude) {
+      const claudeMd = selectedAgent?.claudeMarkdown || generateClaudeMarkdown(selectedAgent?.answers || {})
+      zip.file('CLAUDE.md', claudeMd)
+    }
+    if (designContent && includeDesign) zip.file('design.md', designContent)
+    const ctx = zip.folder('context')
+    if (includeNotes && (project.notes || project.rules)) {
+      let projetoMd = ''
+      if (project.rules) projetoMd += `## Regras\n${project.rules}\n\n`
+      if (project.notes) projetoMd += `## Notas\n${project.notes}\n`
+      ctx?.file('PROJETO.md', projetoMd)
+    }
+    if (selectedPrompts.size > 0) {
+      const promptsFolder = ctx?.folder('prompts')
+      state.prompts.filter((p) => selectedPrompts.has(p.id)).forEach((p) => {
+        promptsFolder?.file(slugify(p.title) + '.md', p.content)
+      })
+    }
+    const blob = await zip.generateAsync({ type: 'blob' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = slugify(project.name) + '-context-kit.zip'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }
+
+  const fileTree = buildFileTree()
+
+  return (
+    <section className="view active">
+      <div className="view-header">
+        <div>
+          <p className="eyebrow">Exportação</p>
+          <h1 className="page-title">Pasta de Projeto</h1>
+        </div>
+      </div>
+      <div className="folder-grid">
+        <div className="folder-selects">
+          <div className="field">
+            <label>Escolher projeto</label>
+            <select value={selectedProjectId} onChange={(e) => { setSelectedProjectId(e.target.value); setSelectedAgentsId(''); setSelectedPrompts(new Set()) }}>
+              <option value="">Nenhum</option>
+              {state.projects.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {!project && (
+            <div className="empty" style={{ gridColumn: '1/-1' }}>
+              <Layers size={32} />
+              <div>Selecione um projeto para montar a pasta.</div>
+            </div>
+          )}
+
+          {project && (
+            <>
+              <div className="card folder-card">
+                <h4 className="folder-card-title">AGENTS.md / CLAUDE.md</h4>
+                <div className="field">
+                  <label>Arquivo AGENTS.md</label>
+                  <select value={selectedAgentsId} onChange={(e) => setSelectedAgentsId(e.target.value)}>
+                    <option value="">Nenhum</option>
+                    {projectAgents.map((a) => (
+                      <option key={a.id} value={a.id}>{a.title}</option>
+                    ))}
+                  </select>
+                </div>
+                {selectedAgent && (
+                  <label className="checkline">
+                    <input type="checkbox" checked={includeClaude} onChange={(e) => setIncludeClaude(e.target.checked)} />
+                    Incluir CLAUDE.md
+                  </label>
+                )}
+              </div>
+
+              <div className="card folder-card">
+                <h4 className="folder-card-title">design.md</h4>
+                {existingDesign && !designContent && (
+                  <div className="design-preview-box">
+                    <p className="item-text">{designPreview || 'design.md vazio'}</p>
+                  </div>
+                )}
+                {designContent ? (
+                  <div className="design-preview-box">
+                    <p className="item-text">{designPreview}</p>
+                    <button className="btn btn-ghost btn-sm" onClick={() => { setDesignContent(''); setDesignPreview('') }}>Remover</button>
+                  </div>
+                ) : (
+                  <div className="design-import-area">
+                    <input ref={fileInputRef} type="file" accept=".md,text/markdown" onChange={handleDesignImport} style={{ display: 'none' }} />
+                    <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()}>
+                      <Upload size={14} /> Importar arquivo
+                    </button>
+                    <textarea value={designContent} onChange={(e) => { setDesignContent(e.target.value); setDesignPreview(e.target.value.split('\n').slice(0, 5).join('\n')) }} placeholder="Ou cole o conteúdo do design.md aqui..." style={{ minHeight: 80 }} />
+                    {designContent && <button className="btn btn-primary btn-sm" onClick={saveDesignAsset}>Salvar como design.md do projeto</button>}
+                  </div>
+                )}
+                {designContent && (
+                  <label className="checkline" style={{ marginTop: 8 }}>
+                    <input type="checkbox" checked={includeDesign} onChange={(e) => setIncludeDesign(e.target.checked)} />
+                    Incluir design.md
+                  </label>
+                )}
+              </div>
+
+              <div className="card folder-card">
+                <h4 className="folder-card-title">Documentos de referência</h4>
+                {projectPrompts.length > 0 && projectPrompts.map((p) => (
+                  <label key={p.id} className="checkline">
+                    <input type="checkbox" checked={selectedPrompts.has(p.id)} onChange={() => togglePrompt(p.id)} />
+                    {p.title}
+                  </label>
+                ))}
+                {projectPrompts.length === 0 && !showAllPrompts && <p className="item-meta">Nenhum prompt vinculado a este projeto.</p>}
+                <label className="checkline" style={{ marginTop: 8 }}>
+                  <input type="checkbox" checked={showAllPrompts} onChange={(e) => setShowAllPrompts(e.target.checked)} />
+                  Mostrar prompts sem projeto
+                </label>
+                {showAllPrompts && allPrompts.map((p) => (
+                  <label key={p.id} className="checkline">
+                    <input type="checkbox" checked={selectedPrompts.has(p.id)} onChange={() => togglePrompt(p.id)} />
+                    {p.title}
+                  </label>
+                ))}
+              </div>
+
+              <div className="card folder-card">
+                <h4 className="folder-card-title">Notas do projeto</h4>
+                <label className="checkline">
+                  <input type="checkbox" checked={includeNotes} onChange={(e) => setIncludeNotes(e.target.checked)} />
+                  Incluir notas/regras como PROJETO.md
+                </label>
+                {includeNotes && (project.rules || project.notes) && (
+                  <div className="design-preview-box" style={{ marginTop: 8 }}>
+                    {project.rules && <p className="item-meta"><strong>Regras:</strong> {project.rules}</p>}
+                    {project.notes && <p className="item-meta"><strong>Notas:</strong> {project.notes}</p>}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {project && (
+          <div className="folder-preview">
+            <div className="preview-pane">
+              <div className="preview-head">
+                <span className="preview-dot" />
+                <span className="preview-filename">Árvore de arquivos</span>
+              </div>
+              <div className="preview-body" style={{ fontFamily: "'Geist Mono', monospace", fontSize: 12 }}>
+                {fileTree.map((line, i) => <div key={i}>{line}</div>)}
+              </div>
+              <div className="preview-foot">
+                <button className="btn btn-primary" onClick={handleExport}>
+                  <Download size={14} /> Exportar .zip
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
   )
 }
 
